@@ -97,6 +97,7 @@ jobs:
     with:
       target: ${{ matrix.target }}
       os: ${{ matrix.os }}
+      webksu: true
 
   build-manager:
     needs: [generate-key]
