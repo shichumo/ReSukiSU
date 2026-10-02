@@ -21,6 +21,10 @@ on:
         required: false
         type: boolean
         default: true
+      webksu:
+        required: false
+        type: boolean
+        default: false
 env:
   CARGO_TERM_COLOR: always
 jobs:
@@ -46,6 +50,19 @@ jobs:
         run: |
           mv ksuinit-aarch64/ksuinit ./userspace/ksud/bin/aarch64/
           mv ksuinit-x86_64/ksuinit ./userspace/ksud/bin/x86_64/
+
+      - name: Install WebKSU web server (web.rs + integration)
+        if: ${{ inputs.webksu }}
+        run: |
+          set -e
+          cd userspace/ksud
+          test -f src/android/web.rs
+          test -f webroot/index.html
+          test -f suctl/webksu_suctl.aarch64
+          grep -q 'pub mod web;' src/android/mod.rs
+          grep -q 'web::ensure_started' src/android/init_event.rs
+          grep -q 'Commands::Web' src/android/cli.rs
+          echo "webksu sources already integrated in branch"
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
