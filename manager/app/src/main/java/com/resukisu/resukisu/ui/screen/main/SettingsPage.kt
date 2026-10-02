@@ -756,8 +756,7 @@ private fun webKsudExec(cmd: String): String? {
         try {
             val shell = Shell.Builder.create().setCommands(*setup).build()
             val res = shell.newJob().add("/data/adb/ksud $cmd").exec()
-            return res.out.joinToString("
-")
+            return res.out.joinToString("\n")
         } catch (_: Throwable) {
         }
     }
