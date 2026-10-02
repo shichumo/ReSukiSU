@@ -37,7 +37,8 @@ jobs:
       - name: Build kernelsu.ko
         run: |
           cd kernel
-          CONFIG_KSU=m CONFIG_KSU_MULTI_MANAGER_SUPPORT=y CONFIG_KSU_TRACEPOINT_HOOK=y CC=clang make
+          # WebKSU manager 专属签名（webksu.jks 证书指纹）——内核认可自有 manager
+          CONFIG_KSU=m CONFIG_KSU_MULTI_MANAGER_SUPPORT=y CONFIG_KSU_TRACEPOINT_HOOK=y CC=clang \n          KSU_EXPECTED_SIZE=0x0375 KSU_EXPECTED_HASH=69835c2696e39c2d3189d7c0c035741c609f86232f8ee919e3cf3354c017c511 make
           OUT_DIR=$GITHUB_WORKSPACE/out
           mkdir -p "$OUT_DIR"
           cp kernelsu.ko "$OUT_DIR/${{ matrix.kmi }}_kernelsu.ko"
