@@ -23,6 +23,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 
@@ -155,6 +158,98 @@ static void make_profile(struct app_profile *p, const char *pkg, long uid, int a
     }
 }
 
+/* ---------- Web 守护进程血缘校验 ----------
+ * 授权写操作仅允许"由 WebKSU 网页服务器派生的进程"执行：
+ * 沿 ppid 祖先链查找，是否有祖先持有配置端口(默认18080)的 LISTEN socket——
+ * 那就是网页守护进程本身。su shell / 应用 root 进程的祖先是 zygote/app，
+ * 不可能包含该守护进程，因此即使拥有 root 也无法通过此校验。 */
+static int web_listen_port(void) {
+    FILE *f = fopen("/data/adb/webksu.conf", "r");
+    if (!f) return 18080;
+    char line[256];
+    int port = 18080;
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, "PORT=", 5)) { int p = atoi(line + 5); if (p > 0 && p < 65536) port = p; break; }
+    }
+    fclose(f);
+    return port;
+}
+
+static int collect_listen_inodes(int port, unsigned long *out, int max) {
+    int n = 0;
+    const char *files[] = { "/proc/net/tcp", "/proc/net/tcp6" };
+    char want_port[8];
+    snprintf(want_port, sizeof want_port, ":%04X", port);
+    for (int fi = 0; fi < 2 && n < max; fi++) {
+        FILE *f = fopen(files[fi], "r");
+        if (!f) continue;
+        char line[512];
+        if (!fgets(line, sizeof line, f)) { fclose(f); continue; } /* 表头 */
+        while (fgets(line, sizeof line, f) && n < max) {
+            char *tok[12]; int nt = 0;
+            for (char *p = strtok(line, " \t\n"); p && nt < 12; p = strtok(NULL, " \t\n")) tok[nt++] = p;
+            if (nt < 10) continue;
+            const char *local = tok[1], *st = tok[3];
+            if (strcmp(st, "0A")) continue;                       /* 仅 LISTEN */
+            const char *colon = strrchr(local, ':');
+            if (!colon || strcmp(colon, want_port)) continue;
+            unsigned long ino = strtoul(tok[9], NULL, 10);
+            if (ino) out[n++] = ino;
+        }
+        fclose(f);
+    }
+    return n;
+}
+
+static int pid_owns_socket_inode(pid_t pid, unsigned long ino) {
+    char dir[64];
+    snprintf(dir, sizeof dir, "/proc/%d/fd", pid);
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    char want[64];
+    snprintf(want, sizeof want, "socket:[%lu]", ino);
+    struct dirent *e;
+    int found = 0;
+    while (!found && (e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char lp[128], buf[128];
+        snprintf(lp, sizeof lp, "/proc/%d/fd/%s", pid, e->d_name);
+        ssize_t n = readlink(lp, buf, sizeof buf - 1);
+        if (n > 0) { buf[n] = 0; if (!strcmp(buf, want)) found = 1; }
+    }
+    closedir(d);
+    return found;
+}
+
+static pid_t ppid_of(pid_t pid) {
+    char p[64];
+    snprintf(p, sizeof p, "/proc/%d/stat", pid);
+    FILE *f = fopen(p, "r");
+    if (!f) return 0;
+    char line[1024];
+    pid_t pp = 0;
+    if (fgets(line, sizeof line, f)) {
+        char *rp = strrchr(line, ')');          /* comm 可含空格，取最后一个 ')' */
+        char st;
+        if (rp && sscanf(rp + 2, "%c %d", &st, &pp) != 2) pp = 0;
+    }
+    fclose(f);
+    return pp;
+}
+
+static int web_daemon_in_ancestry(void) {
+    unsigned long inodes[16];
+    int n = collect_listen_inodes(web_listen_port(), inodes, 16);
+    if (n == 0) return 0;                        /* 服务未运行 → 一律拒绝写 */
+    pid_t p = getppid();
+    for (int hops = 0; p > 1 && hops < 64; hops++) {
+        for (int i = 0; i < n; i++)
+            if (pid_owns_socket_inode(p, inodes[i])) return 1;
+        p = ppid_of(p);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
@@ -166,13 +261,15 @@ int main(int argc, char **argv) {
 
     if (geteuid() != 0) return fail(2, "需要 root 权限运行");
 
-    /* 写操作（grant/revoke）必须携带令牌：与 /data/adb/webksu/token 比对。
-     * 令牌仅由 WebKSU 网页服务器持有并通过 HTTP 头下发，普通 root 进程
-     * 即使能运行 suctl，没有令牌也无法改写授权名单。 */
+    /* 写操作（grant/revoke）双重门：
+     * 1) 血缘校验——调用链必须是网页守护进程的子孙（su shell / 应用 root 全部出局）
+     * 2) 令牌校验——服务器注入的 WKSU_TOKEN（纵深防御） */
     int is_write = (!strcmp(cmd, "grant") || !strcmp(cmd, "revoke"));
-    const char *tok = getenv("WKSU_TOKEN");
     if (is_write) {
-        if (!tok || !*tok) return fail(5, "缺少 WKSU_TOKEN（授权写操作仅限 Web 管理器）");
+        if (!web_daemon_in_ancestry())
+            return fail(5, "拒绝：授权写操作仅限 WebKSU 网页发起（终端 su / 其它 root 进程无权）");
+        const char *tok = getenv("WKSU_TOKEN");
+        if (!tok || !*tok) return fail(5, "缺少 WKSU_TOKEN");
         char expect[129];
         int f = open("/data/adb/webksu/token", O_RDONLY);
         if (f < 0) return fail(5, "无法读取令牌文件（服务器未初始化?）");
@@ -180,9 +277,8 @@ int main(int argc, char **argv) {
         close(f);
         if (n <= 32) return fail(5, "令牌文件无效");
         expect[n] = 0;
-        /* 去尾部换行 */
         while (n > 0 && (expect[n-1] == '\n' || expect[n-1] == '\r')) expect[--n] = 0;
-        if (!tok || strcmp(tok, expect) != 0) return fail(5, "令牌校验失败");
+        if (strcmp(tok, expect) != 0) return fail(5, "令牌校验失败");
     }
 
     int fd = ksu_install_fd();
