@@ -42,10 +42,16 @@ const COMMON_HEADERS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-A
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 
-/* 开机钩子调用：fork 成独立守护进程后运行。
-   services / boot-completed 是 init 用 `exec` 触发的同步短命进程，
-   直接开线程会随主进程退出（网页服务秒死）——必须守护进程化。 */
+/* 开机钩子调用：默认关闭（普通 KSU 行为）；manager 打开 WEB_ENABLED 后才自启 */
 pub fn ensure_started() {
+    if !read_conf().web_enabled {
+        return;
+    }
+    start_bg();
+}
+
+/* 后台守护方式启动（幂等：本进程只 fork 一次，端口占用由 bind 报错兜底） */
+pub fn start_bg() {
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -58,13 +64,73 @@ pub fn ensure_started() {
     };
     if !is_child {
         info!("[webksu] web daemon forked");
-        return; // 父进程（services 本体）继续执行模块脚本
+        return; // 父进程继续执行模块脚本/命令
     }
     // 守护子进程：常驻运行嵌入式 Web 服务器
     if let Err(e) = serve() {
         error!("[webksu] embedded web server exited: {e:#}");
     }
     std::process::exit(0);
+}
+
+/* `ksud web enable/disable/start/stop/status`：供管理器 App 开关与 adb 使用 */
+pub fn control(op: &str) -> Result<()> {
+    match op {
+        "enable" => {
+            set_web_enabled(true)?;
+            println!("web manager enabled (persists across reboots)");
+            start_bg();
+            println!("started: http://127.0.0.1:{}", read_conf().port);
+        }
+        "disable" => {
+            set_web_enabled(false)?;
+            stop_server();
+            println!("web manager disabled and stopped");
+        }
+        "start" => {
+            start_bg();
+            println!("started: http://127.0.0.1:{}", read_conf().port);
+        }
+        "stop" => {
+            stop_server();
+            println!("stopped");
+        }
+        "status" => {
+            let c = read_conf();
+            let running = std::fs::read_to_string(PID_FILE)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .map(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+                .unwrap_or(false);
+            println!("enabled={} running={} port={}", c.web_enabled as u8, running as u8, c.port);
+        }
+        other => bail!("unknown web op: {other}"),
+    }
+    Ok(())
+}
+
+fn set_web_enabled(on: bool) -> Result<()> {
+    let mut lines: Vec<String> = std::fs::read_to_string(CONF_PATH)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.to_string())
+        .filter(|l| !l.trim().starts_with("WEB_ENABLED"))
+        .collect();
+    lines.push(format!("WEB_ENABLED={}", if on { 1 } else { 0 }));
+    let mut out = lines.join("\n");
+    out.push('\n');
+    std::fs::create_dir_all("/data/adb/webksu").ok();
+    std::fs::write(CONF_PATH, out).with_context(|| format!("write {CONF_PATH}"))?;
+    Ok(())
+}
+
+fn stop_server() {
+    if let Ok(pid) = std::fs::read_to_string(PID_FILE) {
+        if let Ok(pid) = pid.trim().parse::<u32>() {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+    }
+    let _ = std::fs::remove_file(PID_FILE);
 }
 
 /* `ksud web`：前台运行 */
@@ -79,6 +145,7 @@ struct Conf {
     port: u16,
     bind: String,
     token: String,
+    web_enabled: bool,
 }
 
 /* 开机部署内嵌的 webksu_suctl（Root 授权工具），幂等：每次启动都覆盖为内嵌版本 */
@@ -101,7 +168,7 @@ fn deploy_suctl() {
 }
 
 fn read_conf() -> Conf {
-    let mut c = Conf { port: 18080, bind: "127.0.0.1".to_string(), token: String::new() };
+    let mut c = Conf { port: 18080, bind: "127.0.0.1".to_string(), token: String::new(), web_enabled: false };
     if let Ok(text) = std::fs::read_to_string(CONF_PATH) {
         for line in text.lines() {
             let line = line.trim();
@@ -122,6 +189,7 @@ fn read_conf() -> Conf {
                         }
                     }
                     "TOKEN" => c.token = v.to_string(),
+                    "WEB_ENABLED" => c.web_enabled = v == "1" || v.eq_ignore_ascii_case("true"),
                     _ => {}
                 }
             }

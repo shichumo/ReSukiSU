@@ -149,8 +149,11 @@ enum Commands {
         command: BootInfo,
     },
 
-    /// Start embedded WebKSU web server (foreground)
-    Web,
+    /// WebKSU embedded web manager control
+    Web {
+        #[command(subcommand)]
+        command: Option<WebOp>,
+    },
 
     /// For developers
     Debug {
@@ -195,6 +198,20 @@ enum UmountConfigOp {
     Clear,
     /// List all configured auto apply umount configuration
     List,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum WebOp {
+    /// Enable web manager at boot and start now (manager app toggle uses this)
+    Enable,
+    /// Disable at boot and stop running server
+    Disable,
+    /// Start server in background now
+    Start,
+    /// Stop running server
+    Stop,
+    /// Print enabled/running status
+    Status,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -754,7 +771,14 @@ pub fn run() -> Result<()> {
             init_event::on_services();
             Ok(())
         }
-        Commands::Web => crate::android::web::serve_blocking(),
+        Commands::Web { command } => match command {
+            None => crate::android::web::serve_blocking(),
+            Some(WebOp::Enable) => crate::android::web::control("enable"),
+            Some(WebOp::Disable) => crate::android::web::control("disable"),
+            Some(WebOp::Start) => crate::android::web::control("start"),
+            Some(WebOp::Stop) => crate::android::web::control("stop"),
+            Some(WebOp::Status) => crate::android::web::control("status"),
+        },
         Commands::Sulogd => sulog::run_sulogd(),
         Commands::Profile { command } => match command {
             Profile::GetSepolicy { package } => profile::get_sepolicy(package),

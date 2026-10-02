@@ -29,6 +29,7 @@ import androidx.compose.material.icons.automirrored.twotone.Undo
 import androidx.compose.material.icons.twotone.Adb
 import androidx.compose.material.icons.twotone.BugReport
 import androidx.compose.material.icons.twotone.Delete
+import androidx.compose.material.icons.twotone.Language
 import androidx.compose.material.icons.twotone.DeleteForever
 import androidx.compose.material.icons.twotone.ElectricalServices
 import androidx.compose.material.icons.twotone.Extension
@@ -87,6 +88,11 @@ import com.resukisu.resukisu.ui.component.settings.SettingsBaseWidget
 import com.resukisu.resukisu.ui.component.settings.SettingsChooseWidget
 import com.resukisu.resukisu.ui.component.settings.SettingsJumpPageWidget
 import com.resukisu.resukisu.ui.component.settings.SettingsSwitchWidget
+import com.topjohnwu.superuser.Shell
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.resukisu.resukisu.ui.navigation.LocalNavigator
 import com.resukisu.resukisu.ui.navigation.Route
 import com.resukisu.resukisu.ui.theme.CardConfig
@@ -243,6 +249,42 @@ fun SettingsPage(bottomPadding: Dp) {
                                                 enabled
                                             )
                                         )
+                                    },
+                                )
+                            }
+
+                            item {
+                                val webCtx = LocalContext.current
+                                var webManagerLoaded by remember { mutableStateOf(false) }
+                                var webManagerOn by remember { mutableStateOf(false) }
+                                LaunchedEffect(Unit) {
+                                    val out = withContext(Dispatchers.IO) { webKsudExec("web status") } ?: ""
+                                    webManagerOn = out.contains("enabled=1")
+                                    webManagerLoaded = true
+                                }
+                                SettingsSwitchWidget(
+                                    icon = Icons.TwoTone.Language,
+                                    title = "Web 管理器",
+                                    description = "开启后可用浏览器管理 Root（http://127.0.0.1:18080），随后可卸载本应用；关闭则为普通 KSU",
+                                    enabled = webManagerLoaded,
+                                    checked = webManagerOn,
+                                    onCheckedChange = { on ->
+                                        webManagerOn = on
+                                        CoroutineScope(Dispatchers.IO).launch {
+                                            val out = webKsudExec("web " + if (on) "enable" else "disable")
+                                            withContext(Dispatchers.Main) {
+                                                if (out != null) {
+                                                    Toast.makeText(
+                                                        webCtx,
+                                                        if (on) "已开启：浏览器访问 http://127.0.0.1:18080" else "已关闭",
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
+                                                } else {
+                                                    webManagerOn = !on
+                                                    Toast.makeText(webCtx, "操作失败（无 Root？）", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }
+                                        }
                                     },
                                 )
                             }
@@ -701,4 +743,23 @@ private fun TopBar(
         windowInsets = TopAppBarDefaults.windowInsets.add(WindowInsets(left = 12.dp)),
         scrollBehavior = scrollBehavior
     )
+}
+
+/* WebKSU: 临时 root shell 执行 ksud 命令（与管理器降级链一致：ksud debug su -> su -> sh） */
+private fun webKsudExec(cmd: String): String? {
+    val setups = listOf(
+        arrayOf("/data/adb/ksud", "debug", "su"),
+        arrayOf("su"),
+        arrayOf("sh"),
+    )
+    for (setup in setups) {
+        try {
+            val shell = Shell.Builder.create().setCommands(*setup).build()
+            val res = shell.newJob().add("/data/adb/ksud $cmd").exec()
+            return res.out.joinToString("
+")
+        } catch (_: Throwable) {
+        }
+    }
+    return null
 }
