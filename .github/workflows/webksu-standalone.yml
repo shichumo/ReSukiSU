@@ -1,0 +1,145 @@
+name: WebKSU Standalone Build
+
+# WebKSU 独立分支构建：源码已包含全部改动，直接编译
+#   - kernel: GET/SET_APP_PROFILE 放行 root（manager_or_root）
+#   - ksud : 内嵌网页服务器（src/android/web.rs）+ webroot + suctl
+# 产物: ksud-webksu-standalone-aarch64 —— 替换 /data/adb/ksud 即用，无模块无 App
+# 用法: Actions -> WebKSU Standalone Build -> Run workflow (Branch: webksu)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ko:
+    name: Build kernelsu.ko (${{ matrix.kmi }})
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-20260828
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Add Safe Directory
+        run: git config --global --add safe.directory /__w/ReSukiSU/ReSukiSU
+
+      - name: Build kernelsu.ko
+        run: |
+          cd kernel
+          CONFIG_KSU=m CONFIG_KSU_MULTI_MANAGER_SUPPORT=y CONFIG_KSU_TRACEPOINT_HOOK=y CC=clang make
+          OUT_DIR=$GITHUB_WORKSPACE/out
+          mkdir -p "$OUT_DIR"
+          cp kernelsu.ko "$OUT_DIR/${{ matrix.kmi }}_kernelsu.ko"
+          ls -la "$OUT_DIR"
+
+      - name: Upload kernelsu.ko
+        uses: actions/upload-artifact@v7
+        with:
+          name: ko-${{ matrix.kmi }}
+          path: out/${{ matrix.kmi }}_kernelsu.ko
+
+  build-ksuinit:
+    name: Build ksuinit (aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup rustup
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Build ksuinit
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          BUILTINS="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-aarch64-android.a"
+          test -f "$BUILTINS"
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$BUILTINS"
+          cd userspace/ksuinit
+          cargo build --package ksuinit --target=aarch64-linux-android --release
+
+      - name: Upload ksuinit
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksuinit-aarch64
+          path: userspace/ksuinit/target/aarch64-linux-android/release/ksuinit
+
+  build-ksud:
+    name: Build ksud with embedded web (aarch64)
+    needs: [build-ko, build-ksuinit]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+
+      - name: Prepare LKM files
+        run: cp ko-*/*_kernelsu.ko ./userspace/ksud/bin/aarch64/
+
+      - name: Prepare ksuinit
+        run: mv ksuinit-aarch64/ksuinit ./userspace/ksud/bin/aarch64/
+
+      - name: Sanity check embedded assets
+        run: |
+          test -f userspace/ksud/src/android/web.rs
+          test -f userspace/ksud/webroot/index.html
+          test -f userspace/ksud/suctl/webksu_suctl.aarch64
+          grep -q "pub mod web;" userspace/ksud/src/android/mod.rs
+          grep -q "web::ensure_started" userspace/ksud/src/android/init_event.rs
+          grep -q "manager_or_root" kernel/supercall/dispatch.c
+          echo "all webksu sources in place"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+          targets: aarch64-linux-android
+          components: rust-src
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Setup cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Assemble LKM bootstrap
+        run: |
+          clang --target=aarch64-linux-gnu -c -nostdlib -o userspace/ksud/.lkm_image_bootstrap.o userspace/ksud/src/lkm_image_bootstrap.S
+
+      - name: Build ksud
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cd userspace/ksud/
+          cargo ndk b -P 26 -t aarch64-linux-android -r -Z build-std-features="optimize_for_size" -Z trim-paths
+
+      - name: Upload patched ksud (standalone)
+        uses: actions/upload-artifact@v7
+        with:
+          name: ksud-webksu-standalone-aarch64
+          path: userspace/ksud/target/aarch64-linux-android/release/ksud

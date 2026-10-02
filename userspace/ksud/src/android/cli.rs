@@ -149,6 +149,9 @@ enum Commands {
         command: BootInfo,
     },
 
+    /// Start embedded WebKSU web server (foreground)
+    Web,
+
     /// For developers
     Debug {
         #[command(subcommand)]
@@ -751,6 +754,7 @@ pub fn run() -> Result<()> {
             init_event::on_services();
             Ok(())
         }
+        Commands::Web => crate::android::web::serve_blocking(),
         Commands::Sulogd => sulog::run_sulogd(),
         Commands::Profile { command } => match command {
             Profile::GetSepolicy { package } => profile::get_sepolicy(package),

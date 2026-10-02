@@ -177,6 +177,7 @@ pub fn on_services() {
     }
 
     info!("on_services triggered!");
+    crate::android::web::ensure_started();
     run_stage("service", false);
 }
 
@@ -188,6 +189,7 @@ pub fn on_boot_completed() {
 
     ksucalls::report_boot_complete();
     info!("on_boot_completed triggered!");
+    crate::android::web::ensure_started();
     run_stage("boot-completed", false);
     // Load susfs boot-completed
     if !is_safe_mode() {
