@@ -167,6 +167,43 @@ fn deploy_suctl() {
     warn!("[webksu] embedded webksu_suctl missing/placeholder — keep existing file");
 }
 
+/* 部署 suctl 写操作令牌（256bit 随机 hex，600 权限）：
+ * 网页 exec API 转发 webksu_suctl 时自动注入 WKSU_TOKEN；
+ * 其它 root 进程直接调 suctl 没有令牌，无法改写授权名单 */
+const TOKEN_FILE: &str = "/data/adb/webksu/token";
+
+fn deploy_token() {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let cur = std::fs::read_to_string(TOKEN_FILE).unwrap_or_default();
+    if cur.trim().len() >= 64 {
+        return; // 已存在，保持稳定
+    }
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15)
+        ^ (std::process::id() as u64) << 32;
+    let mut rand_byte = move || {
+        // xorshift64*
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed.wrapping_mul(0x2545F4914F6CDD1D) >> 24) as u8
+    };
+    let mut tok = String::with_capacity(64);
+    for _ in 0..32 {
+        let b = rand_byte();
+        tok.push(HEX[(b >> 4) as usize & 0xf] as char);
+        tok.push(HEX[b as usize & 0xf] as char);
+    }
+    tok.push('\n');
+    if std::fs::write(TOKEN_FILE, &tok).is_ok() {
+        let _ = Command::new("chmod").args(["600", TOKEN_FILE]).status();
+        let _ = Command::new("chown").args(["0:0", TOKEN_FILE]).status();
+        info!("[webksu] suctl write-token deployed");
+    }
+}
+
 fn read_conf() -> Conf {
     let mut c = Conf { port: 18080, bind: "127.0.0.1".to_string(), token: String::new(), web_enabled: false };
     if let Ok(text) = std::fs::read_to_string(CONF_PATH) {
@@ -203,6 +240,7 @@ fn serve() -> Result<()> {
     let _ = std::fs::create_dir_all("/data/adb/webksu");
     let _ = std::fs::create_dir_all("/data/adb/webksu/webroot"); // 外部网页目录：网页在线更新的写入目标
     deploy_suctl();
+    deploy_token();
     let _ = std::fs::write(PID_FILE, std::process::id().to_string());
     let addr = if conf.bind.contains(':') {
         format!("[{}]:{}", conf.bind, conf.port)
@@ -456,13 +494,18 @@ fn api(stream: &mut TcpStream, query: &str, body: &[u8]) -> Result<()> {
         Some("exec") => {
             let cmd = String::from_utf8(b64_decode(body).context("bad base64 body")?)
                 .context("command is not utf8")?;
-            let out = Command::new("sh")
-                .arg("-c")
+            let mut ec = Command::new("sh");
+            ec.arg("-c")
                 .arg(&cmd)
                 .env("PATH", "/data/adb/ksu/bin:/system/bin:/system/xbin:/sbin")
-                .current_dir("/")
-                .output()
-                .with_context(|| format!("exec failed: {cmd}"))?;
+                .current_dir("/");
+            // suctl 写操作需要令牌：仅当命令确实调用 suctl 时注入（不暴露给任意命令）
+            if cmd.contains("webksu_suctl") {
+                if let Ok(tok) = std::fs::read_to_string(TOKEN_FILE) {
+                    ec.env("WKSU_TOKEN", tok.trim());
+                }
+            }
+            let out = ec.output().with_context(|| format!("exec failed: {cmd}"))?;
             let errno = out.status.code().unwrap_or(1).to_string();
             let stderr_b64 = b64url_encode(&out.stderr);
             respond(
