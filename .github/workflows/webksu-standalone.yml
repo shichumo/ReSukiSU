@@ -41,6 +41,8 @@ jobs:
           OUT_DIR=$GITHUB_WORKSPACE/out
           mkdir -p "$OUT_DIR"
           cp kernelsu.ko "$OUT_DIR/${{ matrix.kmi }}_kernelsu.ko"
+          # 去掉调试信息：13MB -> ~0.4MB，功能完全一致
+          (llvm-strip --strip-debug "$OUT_DIR/${{ matrix.kmi }}_kernelsu.ko" 2>/dev/null             || strip --strip-debug "$OUT_DIR/${{ matrix.kmi }}_kernelsu.ko" 2>/dev/null             || echo "!! strip 工具不可用，保留原始 ko")
           ls -la "$OUT_DIR"
 
       - name: Upload kernelsu.ko
