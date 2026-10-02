@@ -160,6 +160,11 @@ jobs:
             } >> gradle.properties
             echo "${{ secrets.KEYSTORE }}" | base64 -d > key.jks
           fi
+          echo "== key.jks 诊断 =="
+          ls -la key.jks 2>/dev/null || echo "key.jks 不存在"
+          sha256sum key.jks 2>/dev/null
+          keytool -list -v -keystore key.jks -storepass "${{ secrets.KEYSTORE_PASSWORD }}" 2>/dev/null | grep -E "SHA256|Alias name" | head -3 || echo "keytool 读取失败"
+          grep -c "KEYSTORE_FILE" gradle.properties 2>/dev/null || echo "gradle.properties 无 KEYSTORE_FILE"
 
       - name: Write PR key
         if: github.event_name == 'pull_request'
@@ -309,6 +314,11 @@ jobs:
             echo "SIGN_KEYSTORE_PASSWORD=$PROD_KEYSTORE_PASSWORD" >> $GITHUB_ENV
             echo "SIGN_KEY_PASSWORD=$PROD_KEY_PASSWORD" >> $GITHUB_ENV
           fi
+          echo "== repack key.jks 诊断 =="
+          ls -la key.jks 2>/dev/null || echo "key.jks 不存在(repack)"
+          sha256sum key.jks 2>/dev/null
+          keytool -list -v -keystore key.jks -storepass "$SIGN_KEYSTORE_PASSWORD" 2>/dev/null | grep -E "SHA256|Alias" | head -3 || true
+          ls -la ~/.android/debug.keystore 2>/dev/null && echo "!! debug.keystore 存在（gradle 可能用了它）"
 
       - name: Repack and resign
         run: |
