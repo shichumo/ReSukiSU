@@ -77,7 +77,7 @@ enum Commands {
         kmi: Option<String>,
 
         /// manager package name
-        #[arg(long, default_value_t = String::from("com.resukisu.resukisu"))]
+        #[arg(long, default_value_t = String::from("com.shichumo.webksu"))]
         package_name: String,
     },
 
@@ -110,7 +110,7 @@ enum Commands {
 
     /// Uninstall KernelSU modules and itself(LKM Only)
     Uninstall {
-        #[arg(long, default_value_t = String::from("com.resukisu.resukisu"))]
+        #[arg(long, default_value_t = String::from("com.shichumo.webksu"))]
         package_name: String,
     },
 
@@ -227,7 +227,7 @@ enum Debug {
     /// Set the manager app, kernel CONFIG_KSU_DEBUG should be enabled.
     SetManager {
         /// manager package name
-        #[arg(default_value_t = String::from("com.resukisu.resukisu"))]
+        #[arg(default_value_t = String::from("com.shichumo.webksu"))]
         apk: String,
     },
 

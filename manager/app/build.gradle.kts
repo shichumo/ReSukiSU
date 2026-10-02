@@ -119,6 +119,7 @@ android {
     buildToolsVersion = androidBuildToolsVersion
 
     defaultConfig {
+        applicationId = "com.shichumo.webksu"
         minSdk = androidMinSdkVersion
         targetSdk = androidTargetSdkVersion
         versionCode = managerVersionCode
