@@ -87,9 +87,32 @@ jobs:
           name: ksuinit-aarch64
           path: userspace/ksuinit/target/aarch64-linux-android/release/ksuinit
 
+  build-suctl:
+    name: Build webksu_suctl (static musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: webksu
+
+      - name: Build suctl (static)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          mkdir -p out
+          gcc -O2 -static -o out/webksu_suctl.aarch64 native/webksu_suctl.c && aarch64-linux-gnu-strip out/webksu_suctl.aarch64 2>/dev/null || true
+          ls -la out/
+          # 语法 sanity：aarch64 产物必须是 ELF
+          head -c 4 out/webksu_suctl.aarch64 | od -An -tx1 | grep -q "7f 45 4c 46" || (echo BAD ELF && exit 1)
+
+      - name: Upload suctl
+        uses: actions/upload-artifact@v7
+        with:
+          name: webksu-suctl-aarch64
+          path: out/webksu_suctl.aarch64
+
   build-ksud:
     name: Build ksud with embedded web (aarch64)
-    needs: [build-ko, build-ksuinit]
+    needs: [build-ko, build-ksuinit, build-suctl]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -104,6 +127,11 @@ jobs:
 
       - name: Prepare ksuinit
         run: mv ksuinit-aarch64/ksuinit ./userspace/ksud/bin/aarch64/
+
+      - name: Prepare suctl (fresh build)
+        run: |
+          mkdir -p userspace/ksud/suctl
+          cp webksu-suctl-aarch64/webksu_suctl.aarch64 userspace/ksud/suctl/
 
       - name: Sanity check embedded assets
         run: |
