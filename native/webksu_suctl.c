@@ -28,6 +28,7 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 
 /* ---------- 类型（与内核 uapi 一致） ---------- */
 typedef unsigned char  u8;
@@ -160,19 +161,47 @@ static void make_profile(struct app_profile *p, const char *pkg, long uid, int a
 
 /* ---------- Web 守护进程血缘校验 ----------
  * 授权写操作仅允许"由 WebKSU 网页服务器派生的进程"执行：
- * 沿 ppid 祖先链查找，是否有祖先持有配置端口(默认18080)的 LISTEN socket——
+ * 沿 ppid 祖先链查找是否有一个祖先持有网页端口(默认18080)的 LISTEN socket——
  * 那就是网页守护进程本身。su shell / 应用 root 进程的祖先是 zygote/app，
- * 不可能包含该守护进程，因此即使拥有 root 也无法通过此校验。 */
-static int web_listen_port(void) {
-    FILE *f = fopen("/data/adb/webksu.conf", "r");
-    if (!f) return 18080;
+ * 不可能包含该守护进程，因此即使拥有 root 也无法通过此校验。
+ *
+ * 附加约束：持有 socket 的进程必须与 init 处于同一网络命名空间。
+ * /proc/net/tcp 是 per-netns 的，root 可以在私有 netns 里自建 18080 监听，
+ * 自己当"祖先"，从而伪造这条链；netns 比对把这条路堵掉。
+ *
+ * 模块版与独立版的端口配置路径不同，两处都读。 */
+static int read_port_file(const char *path, int *port) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
     char line[256];
-    int port = 18080;
+    int hit = 0;
     while (fgets(line, sizeof line, f)) {
-        if (!strncmp(line, "PORT=", 5)) { int p = atoi(line + 5); if (p > 0 && p < 65536) port = p; break; }
+        if (!strncmp(line, "PORT=", 5)) {
+            int p = atoi(line + 5);
+            if (p > 0 && p < 65536) { *port = p; hit = 1; }
+            break;
+        }
     }
     fclose(f);
-    return port;
+    return hit;
+}
+
+static int web_listen_ports(int *ports, int max) {
+    int n = 0;
+    const char *files[] = {
+        "/data/adb/webksu.conf",                                  /* 独立版（ksud 内嵌） */
+        "/data/adb/modules/resukisu_web_manager/webksu.conf",     /* 模块版 */
+    };
+    for (int i = 0; i < 2 && n < max; i++) {
+        int p = 0;
+        if (read_port_file(files[i], &p) && p > 0) {
+            int dup = 0;
+            for (int j = 0; j < n; j++) if (ports[j] == p) dup = 1;
+            if (!dup) ports[n++] = p;
+        }
+    }
+    if (n == 0) ports[n++] = 18080;  /* 无配置时按默认端口兜底 */
+    return n;
 }
 
 static int collect_listen_inodes(int port, unsigned long *out, int max) {
@@ -201,6 +230,24 @@ static int collect_listen_inodes(int port, unsigned long *out, int max) {
     return n;
 }
 
+/* pid 是否与 init 同属一个网络命名空间 */
+static int same_netns(pid_t pid) {
+    static char init_ns[64];
+    static int init_ok = 0;
+    if (!init_ok) {
+        ssize_t m = readlink("/proc/1/ns/net", init_ns, sizeof init_ns - 1);
+        if (m <= 0) m = readlink("/proc/self/ns/net", init_ns, sizeof init_ns - 1);
+        if (m > 0) { init_ns[m] = 0; init_ok = 1; }
+    }
+    if (!init_ok) return 0;                    /* 无法判定 → 拒绝 */
+    char path[64], buf[64];
+    snprintf(path, sizeof path, "/proc/%d/ns/net", (int)pid);
+    ssize_t n = readlink(path, buf, sizeof buf - 1);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    return !strcmp(buf, init_ns);
+}
+
 static int pid_owns_socket_inode(pid_t pid, unsigned long ino) {
     char dir[64];
     snprintf(dir, sizeof dir, "/proc/%d/fd", pid);
@@ -212,7 +259,7 @@ static int pid_owns_socket_inode(pid_t pid, unsigned long ino) {
     int found = 0;
     while (!found && (e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
-        char lp[128], buf[128];
+        char lp[512], buf[512];
         snprintf(lp, sizeof lp, "/proc/%d/fd/%s", pid, e->d_name);
         ssize_t n = readlink(lp, buf, sizeof buf - 1);
         if (n > 0) { buf[n] = 0; if (!strcmp(buf, want)) found = 1; }
@@ -238,13 +285,17 @@ static pid_t ppid_of(pid_t pid) {
 }
 
 static int web_daemon_in_ancestry(void) {
-    unsigned long inodes[16];
-    int n = collect_listen_inodes(web_listen_port(), inodes, 16);
+    unsigned long inodes[32];
+    int ports[4];
+    int np = web_listen_ports(ports, 4);
+    int n = 0;
+    for (int i = 0; i < np && n < 32; i++)
+        n += collect_listen_inodes(ports[i], inodes + n, 32 - n);
     if (n == 0) return 0;                        /* 服务未运行 → 一律拒绝写 */
     pid_t p = getppid();
     for (int hops = 0; p > 1 && hops < 64; hops++) {
         for (int i = 0; i < n; i++)
-            if (pid_owns_socket_inode(p, inodes[i])) return 1;
+            if (pid_owns_socket_inode(p, inodes[i]) && same_netns(p)) return 1;
         p = ppid_of(p);
     }
     return 0;
@@ -263,7 +314,7 @@ int main(int argc, char **argv) {
 
     /* 写操作（grant/revoke）双重门：
      * 1) 血缘校验——调用链必须是网页守护进程的子孙（su shell / 应用 root 全部出局）
-     * 2) 令牌校验——服务器注入的 WKSU_TOKEN（纵深防御） */
+     * 2) 令牌校验——服务器注入的 WKSU_TOKEN（纵深防御，令牌文件必须 root:600） */
     int is_write = (!strcmp(cmd, "grant") || !strcmp(cmd, "revoke"));
     if (is_write) {
         if (!web_daemon_in_ancestry())
@@ -271,14 +322,23 @@ int main(int argc, char **argv) {
         const char *tok = getenv("WKSU_TOKEN");
         if (!tok || !*tok) return fail(5, "缺少 WKSU_TOKEN");
         char expect[129];
+        struct stat st;
         int f = open("/data/adb/webksu/token", O_RDONLY);
         if (f < 0) return fail(5, "无法读取令牌文件（服务器未初始化?）");
+        if (fstat(f, &st) != 0 || st.st_uid != 0 || (st.st_mode & 077) != 0) {
+            close(f);
+            return fail(5, "令牌文件权限异常（需 root 所有、0600）");
+        }
         ssize_t n = read(f, expect, sizeof(expect) - 1);
         close(f);
         if (n <= 32) return fail(5, "令牌文件无效");
         expect[n] = 0;
         while (n > 0 && (expect[n-1] == '\n' || expect[n-1] == '\r')) expect[--n] = 0;
-        if (strcmp(tok, expect) != 0) return fail(5, "令牌校验失败");
+        size_t tl = strlen(tok);
+        if (tl != (size_t)n) return fail(5, "令牌校验失败");
+        unsigned char diff = 0;
+        for (size_t i = 0; i < tl; i++) diff |= (unsigned char)(tok[i] ^ expect[i]);
+        if (diff) return fail(5, "令牌校验失败");
     }
 
     int fd = ksu_install_fd();

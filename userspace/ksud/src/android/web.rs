@@ -7,8 +7,11 @@
 //   GET/POST /cgi-bin/api?op=ping   探活
 //   POST /cgi-bin/api?op=exec       body=base64(命令)  → X-E=errno X-S=stderr(URL-safe b64) body=stdout
 //   POST /cgi-bin/api?op=write&p=…&m=w|a  body=base64(内容)（仅允许 /data/ 下）
-// 配置 /data/adb/webksu.conf（PORT/BIND/TOKEN，与模块版同格式），
-// PID 写入 /data/adb/webksu/httpd.pid（网页端的服务状态检测直接可用）。
+//   GET  /cgi-bin/api?op=suctl&a=<info|list|granted|grant|revoke|get>&p=<包名>&u=<uid>
+//        授权名单专用端点：服务端校验参数并自行拼命令，只有它能拿到 suctl 的 WKSU_TOKEN
+// 配置 /data/adb/webksu.conf（PORT/BIND/TOKEN/WEB_ENABLED，与模块版同格式），
+// PID 写入 /data/adb/webksu/httpd.pid，带令牌的入口地址写入 /data/adb/webksu/entry.txt（600）。
+// 所有 /cgi-bin/api 请求都必须带令牌（conf TOKEN，缺省时使用 suctl 令牌文件）。
 // 纯 std 实现，不引入任何新依赖。
 
 use std::io::{Read, Write};
@@ -34,6 +37,7 @@ struct SuctlAssets;
 
 const CONF_PATH: &str = "/data/adb/webksu.conf";
 const PID_FILE: &str = "/data/adb/webksu/httpd.pid";
+const ENTRY_FILE: &str = "/data/adb/webksu/entry.txt";
 const SUCTL_DST: &str = "/data/adb/webksu/webksu_suctl";
 /* 外部网页覆盖：存在则优先于内嵌页面 —— 网页更新只需替换此文件，无需重编译/重刷 ksud */
 const EXT_INDEX: &str = "/data/adb/webksu/webroot/index.html";
@@ -42,7 +46,7 @@ const COMMON_HEADERS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-A
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 
-/* 开机钩子调用：默认关闭（普通 KSU 行为）；manager 打开 WEB_ENABLED 后才自启 */
+/* 开机钩子调用：默认启用（独立版就是网页管理器）；webksu.conf 里写 WEB_ENABLED=0 可退回普通 ksud */
 pub fn ensure_started() {
     if !read_conf().web_enabled {
         return;
@@ -73,6 +77,21 @@ pub fn start_bg() {
     std::process::exit(0);
 }
 
+/* 带令牌的入口地址：优先 conf TOKEN，其次 suctl 令牌文件 */
+fn entry_url() -> Option<String> {
+    let c = read_conf();
+    let tok = if c.token.trim().is_empty() {
+        std::fs::read_to_string(TOKEN_FILE).unwrap_or_default().trim().to_string()
+    } else {
+        c.token.trim().to_string()
+    };
+    if tok.is_empty() {
+        return None;
+    }
+    let host = if c.bind.contains(':') { format!("[{}]", c.bind) } else { c.bind.clone() };
+    Some(format!("http://{host}:{}/?t={tok}", c.port))
+}
+
 /* `ksud web enable/disable/start/stop/status`：供管理器 App 开关与 adb 使用 */
 pub fn control(op: &str) -> Result<()> {
     match op {
@@ -80,7 +99,10 @@ pub fn control(op: &str) -> Result<()> {
             set_web_enabled(true)?;
             println!("web manager enabled (persists across reboots)");
             start_bg();
-            println!("started: http://127.0.0.1:{}", read_conf().port);
+            match entry_url() {
+                Some(u) => println!("started: {u}"),
+                None => println!("started: http://127.0.0.1:{}", read_conf().port),
+            }
         }
         "disable" => {
             set_web_enabled(false)?;
@@ -89,7 +111,10 @@ pub fn control(op: &str) -> Result<()> {
         }
         "start" => {
             start_bg();
-            println!("started: http://127.0.0.1:{}", read_conf().port);
+            match entry_url() {
+                Some(u) => println!("started: {u}"),
+                None => println!("started: http://127.0.0.1:{}", read_conf().port),
+            }
         }
         "stop" => {
             stop_server();
@@ -103,6 +128,11 @@ pub fn control(op: &str) -> Result<()> {
                 .map(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
                 .unwrap_or(false);
             println!("enabled={} running={} port={}", c.web_enabled as u8, running as u8, c.port);
+            if running {
+                if let Ok(u) = std::fs::read_to_string(ENTRY_FILE) {
+                    println!("entry: {}", u.trim());
+                }
+            }
         }
         other => bail!("unknown web op: {other}"),
     }
@@ -167,24 +197,31 @@ fn deploy_suctl() {
     warn!("[webksu] embedded webksu_suctl missing/placeholder — keep existing file");
 }
 
-/* 部署 suctl 写操作令牌（256bit 随机 hex，600 权限）：
- * 网页 exec API 转发 webksu_suctl 时自动注入 WKSU_TOKEN；
- * 其它 root 进程直接调 suctl 没有令牌，无法改写授权名单 */
+/* 部署访问令牌（256bit 随机 hex，600 权限）：
+ * 同一个值同时用于 HTTP 鉴权与 suctl 写操作（WKSU_TOKEN）。
+ * 其它 root 进程直接调 suctl 没有令牌/没有祖先链，无法改写授权名单 */
 const TOKEN_FILE: &str = "/data/adb/webksu/token";
 
-fn deploy_token() {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let cur = std::fs::read_to_string(TOKEN_FILE).unwrap_or_default();
-    if cur.trim().len() >= 64 {
-        return; // 已存在，保持稳定
+fn random_token() -> String {
+    // 首选内核 CSPRNG
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let mut buf = [0u8; 32];
+        if f.read_exact(&mut buf).is_ok() {
+            let mut s = String::with_capacity(64);
+            for b in buf {
+                s.push_str(&format!("{b:02x}"));
+            }
+            return s;
+        }
     }
+    // 退路：时间/pid 播种的 xorshift64*
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0x9E3779B97F4A7C15)
         ^ (std::process::id() as u64) << 32;
     let mut rand_byte = move || {
-        // xorshift64*
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
@@ -196,16 +233,25 @@ fn deploy_token() {
         tok.push(HEX[(b >> 4) as usize & 0xf] as char);
         tok.push(HEX[b as usize & 0xf] as char);
     }
-    tok.push('\n');
+    tok
+}
+
+fn deploy_token() {
+    let cur = std::fs::read_to_string(TOKEN_FILE).unwrap_or_default();
+    if cur.trim().len() >= 64 {
+        return; // 已存在，保持稳定
+    }
+    let tok = format!("{}\n", random_token());
     if std::fs::write(TOKEN_FILE, &tok).is_ok() {
         let _ = Command::new("chmod").args(["600", TOKEN_FILE]).status();
         let _ = Command::new("chown").args(["0:0", TOKEN_FILE]).status();
-        info!("[webksu] suctl write-token deployed");
+        info!("[webksu] access token deployed");
     }
 }
 
 fn read_conf() -> Conf {
-    let mut c = Conf { port: 18080, bind: "127.0.0.1".to_string(), token: String::new(), web_enabled: false };
+    // WEB_ENABLED 缺省为开：独立版就是冲着网页管理器编译的；写 WEB_ENABLED=0 可退回普通 ksud
+    let mut c = Conf { port: 18080, bind: "127.0.0.1".to_string(), token: String::new(), web_enabled: true };
     if let Ok(text) = std::fs::read_to_string(CONF_PATH) {
         for line in text.lines() {
             let line = line.trim();
@@ -236,11 +282,18 @@ fn read_conf() -> Conf {
 }
 
 fn serve() -> Result<()> {
-    let conf = read_conf();
+    let mut conf = read_conf();
     let _ = std::fs::create_dir_all("/data/adb/webksu");
     let _ = std::fs::create_dir_all("/data/adb/webksu/webroot"); // 外部网页目录：网页在线更新的写入目标
     deploy_suctl();
     deploy_token();
+    // HTTP 层令牌：conf 没写 TOKEN 时直接沿用 suctl 令牌文件，保证接口永远不是无鉴权状态
+    if conf.token.trim().is_empty() {
+        conf.token = std::fs::read_to_string(TOKEN_FILE).unwrap_or_default().trim().to_string();
+    }
+    if conf.token.is_empty() {
+        bail!("http token unavailable (deploy_token failed)");
+    }
     let _ = std::fs::write(PID_FILE, std::process::id().to_string());
     let addr = if conf.bind.contains(':') {
         format!("[{}]:{}", conf.bind, conf.port)
@@ -248,7 +301,13 @@ fn serve() -> Result<()> {
         format!("{}:{}", conf.bind, conf.port)
     };
     let listener = TcpListener::bind(&addr).with_context(|| format!("bind {addr} failed"))?;
-    info!("[webksu] embedded web ui on http://{addr}");
+    // 带令牌的入口地址写进 600 文件，而不是打进 logcat
+    let entry = format!("http://{addr}/?t={}\n", conf.token);
+    if std::fs::write(ENTRY_FILE, &entry).is_ok() {
+        let _ = Command::new("chmod").args(["600", ENTRY_FILE]).status();
+        let _ = Command::new("chown").args(["0:0", ENTRY_FILE]).status();
+    }
+    info!("[webksu] embedded web ui on http://{addr} (entry with token: {ENTRY_FILE})");
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -494,18 +553,61 @@ fn api(stream: &mut TcpStream, query: &str, body: &[u8]) -> Result<()> {
         Some("exec") => {
             let cmd = String::from_utf8(b64_decode(body).context("bad base64 body")?)
                 .context("command is not utf8")?;
-            let mut ec = Command::new("sh");
-            ec.arg("-c")
+            // 通用命令一律不注入 WKSU_TOKEN：suctl 的写操作只能走下面的 op=suctl
+            let out = Command::new("sh")
+                .arg("-c")
                 .arg(&cmd)
                 .env("PATH", "/data/adb/ksu/bin:/system/bin:/system/xbin:/sbin")
-                .current_dir("/");
-            // suctl 写操作需要令牌：仅当命令确实调用 suctl 时注入（不暴露给任意命令）
-            if cmd.contains("webksu_suctl") {
-                if let Ok(tok) = std::fs::read_to_string(TOKEN_FILE) {
-                    ec.env("WKSU_TOKEN", tok.trim());
-                }
+                .current_dir("/")
+                .output()
+                .with_context(|| format!("exec failed: {cmd}"))?;
+            let errno = out.status.code().unwrap_or(1).to_string();
+            let stderr_b64 = b64url_encode(&out.stderr);
+            respond(
+                stream,
+                "200 OK",
+                "application/octet-stream",
+                &[("X-E", errno.as_str()), ("X-S", stderr_b64.as_str())],
+                &out.stdout,
+            )
+        }
+        Some("suctl") => {
+            let action = query_param(query, "a").unwrap_or_default().to_ascii_lowercase();
+            let pkg = query_param(query, "pkg").unwrap_or_default();
+            let uid_raw = query_param(query, "uid").unwrap_or_default();
+            let need_pkg = matches!(action.as_str(), "grant" | "revoke");
+            let need_uid = matches!(action.as_str(), "grant" | "revoke" | "granted" | "get");
+            if !matches!(action.as_str(), "info" | "list" | "granted" | "grant" | "revoke" | "get") {
+                return respond(stream, "400 Bad Request", "text/plain", &[], b"bad suctl action");
             }
-            let out = ec.output().with_context(|| format!("exec failed: {cmd}"))?;
+            if need_pkg && !valid_pkg(&pkg) {
+                return respond(stream, "400 Bad Request", "text/plain", &[], b"bad package name");
+            }
+            let uid = if need_uid {
+                match uid_raw.trim().parse::<u32>() {
+                    Ok(v) if v < 1_000_000_000 => v,
+                    _ => return respond(stream, "400 Bad Request", "text/plain", &[], b"bad uid"),
+                }
+            } else {
+                0
+            };
+            let token = std::fs::read_to_string(TOKEN_FILE).unwrap_or_default();
+            let token = token.trim();
+            if token.is_empty() {
+                return respond(stream, "500 Internal Server Error", "text/plain", &[], b"suctl token missing");
+            }
+            let mut c = Command::new(SUCTL_DST);
+            c.arg(&action)
+                .env("PATH", "/data/adb/ksu/bin:/system/bin:/system/xbin:/sbin")
+                .env("WKSU_TOKEN", token)
+                .current_dir("/");
+            if need_pkg {
+                c.arg(&pkg);
+            }
+            if need_uid {
+                c.arg(uid.to_string());
+            }
+            let out = c.output().with_context(|| format!("suctl {action} failed"))?;
             let errno = out.status.code().unwrap_or(1).to_string();
             let stderr_b64 = b64url_encode(&out.stderr);
             respond(
@@ -547,6 +649,19 @@ fn api(stream: &mut TcpStream, query: &str, body: &[u8]) -> Result<()> {
         }
         _ => respond(stream, "400 Bad Request", "text/plain", &[], b"unknown op"),
     }
+}
+
+/* 包名合法性：Android 包名只含字母数字 . _ -，且不能以符号/连字符开头、不能含 .. */
+fn valid_pkg(pkg: &str) -> bool {
+    if pkg.is_empty() || pkg.len() > 255 || pkg.contains("..") {
+        return false;
+    }
+    let bytes = pkg.as_bytes();
+    let first = bytes[0];
+    if !(first.is_ascii_alphanumeric() || first == b'_') {
+        return false;
+    }
+    bytes.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'_' || *b == b'-')
 }
 
 fn query_param(query: &str, key: &str) -> Option<String> {
