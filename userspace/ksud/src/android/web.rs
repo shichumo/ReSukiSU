@@ -176,6 +176,7 @@ struct Conf {
     bind: String,
     token: String,
     web_enabled: bool,
+    copy_token: bool,
 }
 
 /* 开机部署内嵌的 webksu_suctl（Root 授权工具），幂等：每次启动都覆盖为内嵌版本 */
@@ -249,9 +250,42 @@ fn deploy_token() {
     }
 }
 
+/* 把令牌写进系统剪贴板：root 守护进程自己没有剪贴板权限，
+ * 交给 WebKSU 管理器的无界面 Activity 完成；管理器未安装或版本过旧时静默失败。 */
+fn copy_token_to_clipboard(token: &str) {
+    if token.is_empty() {
+        return;
+    }
+    let copied = Command::new("/system/bin/am")
+        .args([
+            "start",
+            "-n",
+            "com.shichumo.webksu/com.resukisu.resukisu.ui.CopyTokenActivity",
+            "--es",
+            "text",
+            token,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if copied {
+        info!("[webksu] token copied to clipboard");
+    } else {
+        warn!("[webksu] copy token failed (WebKSU manager missing or too old?)");
+    }
+}
+
 fn read_conf() -> Conf {
     // WEB_ENABLED 缺省为开：独立版就是冲着网页管理器编译的；写 WEB_ENABLED=0 可退回普通 ksud
-    let mut c = Conf { port: 18080, bind: "127.0.0.1".to_string(), token: String::new(), web_enabled: true };
+    let mut c = Conf {
+        port: 18080,
+        bind: "127.0.0.1".to_string(),
+        token: String::new(),
+        web_enabled: true,
+        copy_token: true,
+    };
     if let Ok(text) = std::fs::read_to_string(CONF_PATH) {
         for line in text.lines() {
             let line = line.trim();
@@ -273,6 +307,7 @@ fn read_conf() -> Conf {
                     }
                     "TOKEN" => c.token = v.to_string(),
                     "WEB_ENABLED" => c.web_enabled = v == "1" || v.eq_ignore_ascii_case("true"),
+                    "COPY_TOKEN" => c.copy_token = v != "0" && !v.eq_ignore_ascii_case("false"),
                     _ => {}
                 }
             }
@@ -306,6 +341,10 @@ fn serve() -> Result<()> {
     if std::fs::write(ENTRY_FILE, &entry).is_ok() {
         let _ = Command::new("chmod").args(["600", ENTRY_FILE]).status();
         let _ = Command::new("chown").args(["0:0", ENTRY_FILE]).status();
+    }
+    // 启动即把令牌放进剪贴板，省去手动查 entry.txt；COPY_TOKEN=0 可关掉
+    if conf.copy_token {
+        copy_token_to_clipboard(&conf.token);
     }
     info!("[webksu] embedded web ui on http://{addr} (entry with token: {ENTRY_FILE})");
     for stream in listener.incoming() {

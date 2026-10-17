@@ -529,4 +529,7 @@
     <string name="manager_update_details">版本: %1$s (%2$d)\n架構: %3$s</string>
     <string name="settings_check_beta_update">檢查測試版本更新</string>
     <string name="settings_check_beta_update_summary">自動檢查main分支之測試版本建構</string>
+    <string name="webksu_token_clip_label">WebKSU 令牌</string>
+    <string name="webksu_token_copied">WebKSU 令牌已複製到剪貼簿</string>
+    <string name="webksu_token_copy_failed">複製失敗：%1$s</string>
 </resources>

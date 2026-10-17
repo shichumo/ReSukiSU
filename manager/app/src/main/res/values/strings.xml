@@ -546,4 +546,7 @@
     <string name="manager_update_details">Version: %1$s (%2$d)\nArchitecture: %3$s</string>
     <string name="settings_check_beta_update">Check beta updates</string>
     <string name="settings_check_beta_update_summary">Auto-check beta builds from the main branch</string>
+    <string name="webksu_token_clip_label">WebKSU token</string>
+    <string name="webksu_token_copied">WebKSU token copied to clipboard</string>
+    <string name="webksu_token_copy_failed">Copy failed: %1$s</string>
 </resources>

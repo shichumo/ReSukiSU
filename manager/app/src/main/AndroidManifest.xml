@@ -67,6 +67,13 @@
                 <data android:mimeType="application/vnd.android.package-archive" />
             </intent-filter>
         </activity>
+        <!-- WebKSU：无界面写剪贴板，供 ksud 内嵌网页服务/模块脚本复制令牌 -->
+        <activity
+            android:name=".ui.CopyTokenActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <!-- 切换图标 -->
         <activity-alias
             android:name=".ui.MainActivityAlias"

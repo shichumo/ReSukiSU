@@ -532,4 +532,7 @@
     <string name="susfs_enable_config">SUSFS 管理器</string>
     <string name="susfs_enable_config_summary">啟用內置 SUSFS 管理器，可能與第三方模組衝突。</string>
     <string name="susfs_config_disable_warning">內置 SUSFS 管理器已停用。請啟用它或安裝第三方模組以使用 SUSFS 功能。</string>
+    <string name="webksu_token_clip_label">WebKSU 令牌</string>
+    <string name="webksu_token_copied">WebKSU 令牌已複製到剪貼簿</string>
+    <string name="webksu_token_copy_failed">複製失敗：%1$s</string>
 </resources>
