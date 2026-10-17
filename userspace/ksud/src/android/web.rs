@@ -317,16 +317,15 @@ fn read_conf() -> Conf {
 }
 
 fn serve() -> Result<()> {
-    let mut conf = read_conf();
+    let conf = read_conf();
     let _ = std::fs::create_dir_all("/data/adb/webksu");
     let _ = std::fs::create_dir_all("/data/adb/webksu/webroot"); // 外部网页目录：网页在线更新的写入目标
     deploy_suctl();
     deploy_token();
-    // HTTP 层令牌：conf 没写 TOKEN 时直接沿用 suctl 令牌文件，保证接口永远不是无鉴权状态
-    if conf.token.trim().is_empty() {
-        conf.token = std::fs::read_to_string(TOKEN_FILE).unwrap_or_default().trim().to_string();
-    }
-    if conf.token.is_empty() {
+    // 当前生效令牌：conf TOKEN 优先，否则用 suctl 令牌文件；每次请求都会重新读，
+    // 所以改 webksu.conf 后无需重启服务即可生效
+    let token = current_http_token();
+    if token.is_empty() {
         bail!("http token unavailable (deploy_token failed)");
     }
     let _ = std::fs::write(PID_FILE, std::process::id().to_string());
@@ -336,23 +335,17 @@ fn serve() -> Result<()> {
         format!("{}:{}", conf.bind, conf.port)
     };
     let listener = TcpListener::bind(&addr).with_context(|| format!("bind {addr} failed"))?;
-    // 带令牌的入口地址写进 600 文件，而不是打进 logcat
-    let entry = format!("http://{addr}/?t={}\n", conf.token);
-    if std::fs::write(ENTRY_FILE, &entry).is_ok() {
-        let _ = Command::new("chmod").args(["600", ENTRY_FILE]).status();
-        let _ = Command::new("chown").args(["0:0", ENTRY_FILE]).status();
-    }
+    sync_entry_file(&token);
     // 启动即把令牌放进剪贴板，省去手动查 entry.txt；COPY_TOKEN=0 可关掉
     if conf.copy_token {
-        copy_token_to_clipboard(&conf.token);
+        copy_token_to_clipboard(&token);
     }
     info!("[webksu] embedded web ui on http://{addr} (entry with token: {ENTRY_FILE})");
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
-                let token = conf.token.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = handle(s, &token) {
+                    if let Err(e) = handle(s) {
                         warn!("[webksu] connection error: {e:#}");
                     }
                 });
@@ -370,7 +363,43 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
-fn handle(mut stream: TcpStream, token: &str) -> Result<()> {
+/* 当前生效的 HTTP 令牌：conf TOKEN 优先，其次 suctl 令牌文件。
+ * 每个请求都会重新读，改 webksu.conf 的 TOKEN= 无需重启服务。 */
+fn current_http_token() -> String {
+    let c = read_conf();
+    let t = c.token.trim();
+    if !t.is_empty() {
+        return t.to_string();
+    }
+    std::fs::read_to_string(TOKEN_FILE)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/* 令牌变化时同步 entry.txt，保证剪贴板里/看到的入口地址与当前令牌一致 */
+fn sync_entry_file(token: &str) {
+    if token.is_empty() {
+        return;
+    }
+    let c = read_conf();
+    let host = if c.bind.contains(':') {
+        format!("[{}]", c.bind)
+    } else {
+        c.bind.clone()
+    };
+    let want = format!("http://{host}:{}/?t={token}\n", c.port);
+    let cur = std::fs::read_to_string(ENTRY_FILE).unwrap_or_default();
+    if cur != want {
+        if std::fs::write(ENTRY_FILE, want).is_ok() {
+            let _ = Command::new("chmod").args(["600", ENTRY_FILE]).status();
+            let _ = Command::new("chown").args(["0:0", ENTRY_FILE]).status();
+            info!("[webksu] entry.txt updated (token changed)");
+        }
+    }
+}
+
+fn handle(mut stream: TcpStream) -> Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
 
@@ -434,13 +463,10 @@ fn handle(mut stream: TcpStream, token: &str) -> Result<()> {
         return respond(&mut stream, "204 No Content", "text/plain", &[], &[]);
     }
 
-    // TOKEN 校验（query t 或 X-Token 头，与模块版一致）
-    if !token.is_empty() {
-        let q = query_param(query, "t").unwrap_or_default();
-        if q != token && header_token != token {
-            return respond(&mut stream, "403 Forbidden", "text/plain", &[], b"forbidden: token mismatch");
-        }
-    }
+    // 只有 /cgi-bin/api 需要令牌；页面、shim、/mod/ 代理必须免令牌，
+    // 否则浏览器打开模块 WebUI 及其子资源会 403（令牌只保护 root API）
+    let token = current_http_token();
+    sync_entry_file(&token);
 
     if path == "/" || path == "/index.html" {
         // 外部覆盖优先：更新网页只需替换文件，浏览器刷新即生效
@@ -456,6 +482,10 @@ fn handle(mut stream: TcpStream, token: &str) -> Result<()> {
     }
 
     if path == "/cgi-bin/api" {
+        let q = query_param(query, "t").unwrap_or_default();
+        if token.is_empty() || (q != token && header_token != token) {
+            return respond(&mut stream, "403 Forbidden", "text/plain", &[], b"forbidden: token mismatch");
+        }
         return api(&mut stream, query, &body);
     }
 
@@ -541,11 +571,18 @@ const KSU_SHIM: &str = r#"(function () {
     catch (e) { return ''; }
   }
   var TOKEN = '';
-  try { TOKEN = localStorage.getItem('webksu-token') || ''; } catch (e) {}
+  try {
+    var tm = location.search.match(/[?&]t=([0-9a-fA-F]{64})/);
+    if (tm) localStorage.setItem('webksu-token', tm[1].toLowerCase());
+    TOKEN = localStorage.getItem('webksu-token') || '';
+  } catch (e) {}
+  function tokenNow() {
+    try { return localStorage.getItem('webksu-token') || TOKEN; } catch (e) { return TOKEN; }
+  }
   function apiExec(cmd) {
     return fetch('/cgi-bin/api?op=exec', {
       method: 'POST',
-      headers: { 'Content-Type': 'text/plain', 'X-Token': TOKEN },
+      headers: { 'Content-Type': 'text/plain', 'X-Token': tokenNow() },
       body: b64e(cmd)
     }).then(function (r) {
       return r.text().then(function (t) {
