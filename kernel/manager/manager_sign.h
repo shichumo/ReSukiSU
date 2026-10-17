@@ -25,6 +25,11 @@
 #define EXPECTED_SIZE_KOWX712 0x375
 #define EXPECTED_HASH_KOWX712 "484fcba6e6c43b1fb09700633bf2fb4758f13cb0b2f4457b80d075084b26c588"
 
+// WebKSU（shichumo/ReSukiSU fork）—— 用 webksu.jks 签名的管理器 APK
+// 证书 DER 885 字节(0x375)，sha256 由证书文件算出；改签名密钥时必须同步更新这里
+#define EXPECTED_SIZE_WEBKSU 0x375
+#define EXPECTED_HASH_WEBKSU "69835c2696e39c2d3189d7c0c035741c609f86232f8ee919e3cf3354c017c511"
+
 typedef struct {
     unsigned size;
     const char *sha256;
