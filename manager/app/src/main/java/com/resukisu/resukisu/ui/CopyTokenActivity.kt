@@ -21,8 +21,10 @@ import com.resukisu.resukisu.R
 class CopyTokenActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // getLaunchedFromUid() 在不少 ROM 上对 am start 返回 -1（UNKNOWN），
+        // 所以未知调用方放行，只拦明确来自普通应用的调用
         val fromUid = launchedFromUid
-        if (fromUid != 0 && fromUid != 2000 && fromUid != applicationInfo.uid) {
+        if (fromUid != -1 && fromUid != 0 && fromUid != 2000 && fromUid != applicationInfo.uid) {
             Log.w(TAG, "CopyTokenActivity: rejected caller uid=$fromUid")
             finish()
             return
